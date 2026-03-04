@@ -1,0 +1,424 @@
+PoseTracker jump upload integration (React Native WebView)
+==========================================================
+
+This document explains, in detail, how the demo app integrates PoseTracker's
+*upload tracking* mode specifically for jump exercises:
+
+- `jump_analysis`
+- `air_time_jump`
+
+It is written both for:
+- a human developer who wants to reproduce the integration, and
+- an LLM agent that needs a precise description of the moving parts.
+
+All code references below are from:
+- `app/App.tsx`
+- `app/lib/exerciseEngine.ts`
+
+-------------------------------------------------------------------------------
+1. High‑level flow
+-------------------------------------------------------------------------------
+
+For jump exercises, the app uses PoseTracker's V3 engine via a `WebView` that
+loads the official `/upload_tracking` endpoint:
+
+  GET https://app.posetracker.com/pose_tracker/upload_tracking
+
+The flow is:
+
+1. User selects the **Video upload** mode in the React Native UI.
+2. User picks one of the jump exercises: `jump_analysis` or `air_time_jump`.
+3. For `jump_analysis` only:
+   - The app asks the user for their height (cm or ft/in),
+   - converts it to centimeters,
+   - then starts the jump tracking with `userHeightCm` in the query string.
+4. The app builds the iframe/WebView URL with:
+   - `token`, `exercise`, `width`, `height`, `isMobile`, `source=video`, etc.
+5. The `WebView` displays PoseTracker's upload UI:
+   - user picks a video file from the device,
+   - PoseTracker processes the video and runs the jump logic.
+6. PoseTracker sends structured JSON messages back to the app via
+   `window.ReactNativeWebView.postMessage`.
+7. The React Native side listens to those messages in `onMessage`, parses them,
+   and updates local state: jump height, air time, etc.
+8. A native overlay renders jump‑specific cards on top of the WebView.
+
+Only the **overlay and state** live in React Native; **all jump analysis and
+upload handling** live inside PoseTracker's hosted web app.
+
+-------------------------------------------------------------------------------
+2. Exercise registry (jump‑only scope)
+-------------------------------------------------------------------------------
+
+File: `app/lib/exerciseEngine.ts`
+
+This file centralizes the PoseTracker exercises exposed to the app. For jumps:
+
+- `jump_analysis` (custom, dynamic)
+- `air_time_jump` (custom, dynamic)
+
+The relevant entries:
+
+  - key: unique PoseTracker exercise ID used in the query parameter
+  - name: human‑readable label shown in the UI
+  - movement_type: `"dynamic"` here (but only affects UI labels, not PoseTracker)
+  - type: `"custom"` to distinguish from base V3 exercises
+
+The helper functions:
+
+- `listExercises()` returns all exercise keys,
+- `getExerciseInfo(key)` resolves metadata for the selection UI.
+
+For an LLM: if you need to know *which* exercises should use the jump overlay,
+look for the helper in `App.tsx`:
+
+- `isJumpExercise(key)` which returns true for `jump_analysis` and `air_time_jump`.
+
+-------------------------------------------------------------------------------
+3. React Native state machine (modes + exercise selection)
+-------------------------------------------------------------------------------
+
+File: `app/App.tsx`
+
+Key state variables that drive everything:
+
+- `mode: "realtime" | "upload" | null`
+  - `"realtime"` → live camera tracking (`/tracking`)
+  - `"upload"` → upload tracking on pre‑recorded video (`/upload_tracking`)
+
+- `selectedExercise: string | null`
+  - PoseTracker exercise key, e.g. `"jump_analysis"` or `"air_time_jump"`.
+
+- `trackingStarted: boolean`
+  - Controls whether the app is currently showing the `WebView` with PoseTracker
+    (true) or the selection/height screen (false).
+
+- `userHeightCm: number | null`
+  - Only used for `jump_analysis` to scale jump height from the user height.
+
+- `jumpMetrics: { lastHeightCm?: number; lastAirTimeSeconds?: number } | null`
+  - Stores the latest jump height and air time emitted by PoseTracker and
+    displayed in the overlay.
+
+Helpers/constants:
+
+- `isJumpExercise(key)` → true for `jump_analysis` / `air_time_jump`.
+- `requiresUserHeight(key)` → true only for `jump_analysis`.
+- `isJumpOverlay` → derived from `isJumpExercise(selectedExercise)`.
+- `isUploadMode` → `mode === "upload"`.
+
+Important callback:
+
+`handleSelectExercise(exerciseKey: string)`:
+- Resets counters, form score, user height, and jump metrics.
+- Sets `selectedExercise = exerciseKey`.
+- If the exercise *requires* user height (`jump_analysis`), it keeps
+  `trackingStarted = false` so that the height card is shown.
+- Otherwise (`air_time_jump`), it sets `trackingStarted = true` immediately to
+  jump directly into PoseTracker.
+
+-------------------------------------------------------------------------------
+4. Height capture for `jump_analysis`
+-------------------------------------------------------------------------------
+
+Still in `app/App.tsx`.
+
+Because `jump_analysis` depends on the user's height for scaling, the app
+implements a small height wizard at the bottom of the screen when:
+
+- a jump exercise is selected,
+- and `requiresUserHeight(selectedExercise)` is true,
+- and tracking has not started yet (`!trackingStarted`).
+
+State:
+
+- `heightUnit: "cm" | "ft_in"`
+- `heightCmInput: string`
+- `heightFeetInput: string`
+- `heightInchesInput: string`
+
+Utility:
+
+- `computeHeightCm()`:
+  - if unit is `"cm"`, parses a single numeric field;
+  - if unit is `"ft_in"`, parses feet and inches, then:
+      `totalInches = feet * 12 + inches` → `cm = totalInches * 2.54`.
+  - returns `number | null` depending on validity.
+
+- `hasValidHeight` (memoized) is used to enable/disable the "start jump" button.
+
+Action:
+
+- `handleStartJumpTracking()`:
+  - If the exercise does *not* require user height (e.g. `air_time_jump`),
+    simply sets `trackingStarted = true`.
+  - If it *does* (`jump_analysis`), it:
+      1. calls `computeHeightCm()`,
+      2. stores the value in `userHeightCm`,
+      3. sets `trackingStarted = true`.
+
+Once `trackingStarted` is true and the URL is ready, the component switches to
+the full‑screen WebView view for PoseTracker.
+
+-------------------------------------------------------------------------------
+5. Building the PoseTracker URL for jump upload
+-------------------------------------------------------------------------------
+
+The URL is computed via a `useMemo` called `iframeSrc`:
+
+Inputs:
+
+- `mode` (must be `"upload"` for this document),
+- `selectedExercise` (one of `jump_analysis`, `air_time_jump`, or others),
+- `userHeightCm` (if any).
+
+Pseudo‑logic:
+
+1. If either `selectedExercise` or `mode` is null → `iframeSrc = null`.
+2. Start a `URLSearchParams` called `params`.
+3. Set shared parameters:
+   - `token` → PoseTracker API key (`TOKEN` constant).
+   - `exercise` → the selected exercise key.
+   - `width` / `height` → current screen dimensions in pixels.
+   - `isMobile` → `"true"` (recommended for mobile webviews).
+4. Jump‑specific parameter:
+   - If `requiresUserHeight(selectedExercise)` and `userHeightCm` is not null:
+       `params.set("userHeightCm", String(Math.round(userHeightCm)))`.
+5. Choose base URL:
+   - For realtime: `${TRACKING_BASE}/pose_tracker/tracking`
+   - For upload: `${TRACKING_BASE}/pose_tracker/upload_tracking`
+6. Upload‑specific parameters (jump upload):
+   - `source = "video"` (user selects a local video).
+   - `skeleton = "true"` (draw skeleton overlay).
+   - `postureBox = "false"` (no realtime posture box UI).
+   - `uploadLabel = "Upload a video"` (custom button text).
+
+Final URL example for `jump_analysis`:
+
+  https://app.posetracker.com/pose_tracker/upload_tracking
+    ?token=YOUR_API_KEY
+    &exercise=jump_analysis
+    &source=video
+    &width=...
+    &height=...
+    &isMobile=true
+    &userHeightCm=...
+    &skeleton=true
+    &postureBox=false
+    &uploadLabel=Upload%20a%20video
+
+For `air_time_jump`, `userHeightCm` is omitted.
+
+-------------------------------------------------------------------------------
+6. WebView bridge (message forwarding)
+-------------------------------------------------------------------------------
+
+The JS bridge injected into the WebView (`jsBridge` constant) does three things:
+
+1. Listens for `window` `"message"` events and forwards them to React Native:
+
+   - `window.addEventListener('message', (event) => {`
+   -   `window.ReactNativeWebView.postMessage(JSON.stringify(event.data));`
+   - `});`
+
+2. Exposes a `window.webViewCallback` helper for PoseTracker to call directly:
+
+   - `window.webViewCallback = (data) => {`
+   -   `window.ReactNativeWebView.postMessage(JSON.stringify(data));`
+   - `};`
+
+3. Overrides `window.postMessage` to also relay messages to React Native,
+   regardless of how PoseTracker emits them.
+
+On the React Native side, we handle messages in `onMessage`:
+
+- We parse `event.nativeEvent.data` as JSON.
+- Based on `data.type`, we route to different state updates.
+
+For jump integration, the important types are:
+
+- `type: "jump_height"`
+  - Expected payload (shape inferred from usage):
+    - `jumpHeightCm: number | undefined`
+    - `airTimeSeconds: number | undefined`
+  - The app updates:
+    - `jumpMetrics.lastHeightCm`
+    - `jumpMetrics.lastAirTimeSeconds`
+
+- `type: "jump_summary"`
+  - Expected payload (from usage):
+    - `maxJumpHeight: number | undefined`
+  - The app updates:
+    - `jumpMetrics.lastHeightCm` with the maximum jump height.
+
+Other message types exist (`counter`, `keypoints`, etc.) but are not essential
+for jump upload unless you want to combine counters with jumps.
+
+-------------------------------------------------------------------------------
+7. Jump overlay UI (React Native side)
+-------------------------------------------------------------------------------
+
+When `trackingStarted` is true and `iframeSrc` is not null, `App.tsx` renders:
+
+- A full‑screen `WebView` showing PoseTracker.
+- A React Native overlay (`View` with `StyleSheet.absoluteFillObject`) on top.
+
+For **jump exercises only**, identified via `isJumpOverlay`, the bottom of the
+overlay shows two cards:
+
+Left card:
+- Label: `"Air time"`.
+- Value: from `jumpMetrics.lastAirTimeSeconds`.
+- Format: one decimal, e.g. `"0.6 s"`, or `"—"` if no data.
+
+Right card:
+- Label: `"Jump height"`.
+- Value: from `jumpMetrics.lastHeightCm`.
+- Format: one decimal, no unit in the number; `"cm"` displayed as a separate
+  text element underneath.
+
+Visual details:
+
+- Cards are semi‑transparent dark rectangles with rounded corners and borders.
+- The layout uses `flexDirection: "row"` with `justifyContent: "space-between"`.
+- On iOS, they sit above the safe‑area bottom.
+- In **upload mode**, an additional style (`bottomCardsUploadJump`) shifts the
+  cards upwards so they do not overlap the native video controls inside the
+  WebView.
+
+Overlay positioning in code:
+
+- `isJumpOverlay` → choose jump cards vs rep/duration cards.
+- `isUploadMode` → apply `styles.bottomCardsUploadJump` to lift the cards.
+
+-------------------------------------------------------------------------------
+8. Exporting the processed video (conceptual guidance)
+-------------------------------------------------------------------------------
+
+PoseTracker's shared parameters doc mentions an `export` flag for upload
+tracking:
+
+- Query param: `export`
+- Type: boolean
+- Scope: video upload only (`source=video`)
+- Plan: Developer/Custom/Company only
+- Effect: enables an **export overlay** that lets the user download or access
+  the processed video (with overlays burned in).
+
+This demo app currently focuses on:
+
+- selecting a video,
+- running jump analysis,
+- reading live results (`jump_height`, `jump_summary`),
+- and rendering native overlays.
+
+It does **not yet** implement explicit handling for exported video URLs. For a
+production integration where you want to capture the processed video inside
+your native app, use the following patterns.
+
+8.1. Enabling export in the WebView URL
+---------------------------------------
+
+When building `iframeSrc` for upload mode, add:
+
+- `params.set("export", "true");`
+
+to enable PoseTracker's export UI. This will let the user trigger the export at
+the end of processing (subject to plan constraints).
+
+8.2. Capturing the exported video URL in React Native
+-----------------------------------------------------
+
+There are two typical patterns for React Native WebView integrations:
+
+1) **Intercept navigation to the exported video URL**
+
+If the export overlay opens the processed video as a new URL
+(for example an `.mp4` link), you can use:
+
+- `onShouldStartLoadWithRequest` (iOS + Android)
+
+Logic (conceptual):
+
+- If the `request.url` matches your expected export pattern
+  (e.g. domain + path or `.mp4` suffix),
+  - prevent the WebView from navigating there (return `false`),
+  - instead, store that URL in React Native state,
+  - optionally show your own native video player or upload that URL elsewhere.
+
+2) **Listen to a dedicated export message**
+
+PoseTracker may also send a JSON message when the export is ready
+(`type: "export"` or similar; check the PoseTracker docs for the exact shape).
+
+To support this pattern:
+
+- Extend the `onMessage` handler in `App.tsx` with an additional branch:
+  - `else if (data.type === "export") { ... }`
+- Inside, extract the exported video URL (e.g. `data.exportUrl`) and store it in
+  React Native state.
+
+You can then:
+
+- trigger a native download,
+- upload to your own backend,
+- or navigate to another screen with that URL.
+
+8.3. Where to store the exported video in the app
+-------------------------------------------------
+
+At the app level, a common pattern is to introduce:
+
+- `const [exportedVideoUrl, setExportedVideoUrl] = useState<string | null>(null);`
+
+Then:
+
+- inside `onMessage` or `onShouldStartLoadWithRequest`, set this value when an
+  export is detected;
+- navigate to a "Review jump" screen that:
+  - plays the video with the overlay (using e.g. `react-native-video`),
+  - shows the final jump metrics (height, air time, summary),
+  - allows saving or sharing the video.
+
+This logic is not implemented in the current demo, but it is where an LLM agent
+or another developer should plug in additional code if full video export
+handling is required.
+
+-------------------------------------------------------------------------------
+9. How an LLM agent should use this description
+-------------------------------------------------------------------------------
+
+For an LLM integrating PoseTracker jump upload in another app, the key steps
+to follow are:
+
+1. Recreate the same **mode + exercise** state machine:
+   - `"realtime"` vs `"upload"`,
+   - with `jump_analysis` / `air_time_jump` as exercises.
+
+2. Implement **height capture** for `jump_analysis` and pass `userHeightCm`
+   in the query string to PoseTracker.
+
+3. Build the `iframeSrc` URL as described:
+   - `/pose_tracker/upload_tracking`,
+   - `source=video`,
+   - `exercise=jump_analysis|air_time_jump`,
+   - screen `width` / `height`,
+   - `isMobile=true`,
+   - `userHeightCm` for `jump_analysis`,
+   - optional `export=true` if you need downloadable video.
+
+4. Inject a JS bridge that forwards messages from PoseTracker to the native
+   layer and handle at least:
+   - `type: "jump_height"` (per‑jump results),
+   - `type: "jump_summary"` (session summary).
+
+5. Render a **native overlay** on top of the WebView, driven only by those
+   messages and your app state, without modifying the hosted PoseTracker UI.
+
+6. If you need to **retrieve the processed video**, choose and implement one of
+   the export‑capture strategies described in section 8.
+
+By following these steps and mirroring the patterns in `app/App.tsx`, another
+developer—or an LLM agent modifying this project—can reliably integrate
+PoseTracker's jump upload feature and extend it to new use‑cases.
+

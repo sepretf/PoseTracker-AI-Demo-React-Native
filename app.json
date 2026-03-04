@@ -1,30 +1,45 @@
 {
   "expo": {
-    "name": "app",
-    "slug": "app",
+    "name": "PoseTracker Demo",
+    "slug": "posetracker-demo",
+    "scheme": "posetracker-demo",
     "version": "1.0.0",
-    "orientation": "portrait",
+    "orientation": "default",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "newArchEnabled": true,
+    "plugins": ["./plugins/withHardwareAcceleration", "./plugins/withRemoveOrientationRestriction"],
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#1a1a1a"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.posetracker.demoapp",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app uses the camera for real-time pose tracking during exercises.",
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
+      "package": "com.posetracker.v3demo",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#1a1a1a"
       },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "edgeToEdgeEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "975d43c3-c584-49cc-8a61-082ed03df424"
+      }
     }
   }
 }

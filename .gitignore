@@ -2,6 +2,7 @@
 
 # dependencies
 node_modules/
+yarn.lock
 
 # Expo
 .expo/
@@ -31,7 +32,20 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
+.env.*
+!.env.example
 .env*.local
+
+# Google Play service account key (do not commit)
+play-store-key.json
+*-play-store*.json
+
+# Local EAS submit config with personal credentials (do not commit)
+eas.local.json
+
+# Local helper notes
+eas builds and release.txt
 
 # typescript
 *.tsbuildinfo
